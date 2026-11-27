@@ -51,7 +51,8 @@ if [ ! -f "$BACKEND/.env" ]; then
 fi
 
 echo "[1/2] 启动后端 LangGraph (127.0.0.1:2024)..."
-(cd "$BACKEND" && "$VENV/Scripts/langgraph.exe" dev --no-browser --port 2024) &
+# 通过 dev_server.py 启动：先安装东八区日志时间戳补丁，再进入 LangGraph CLI。
+(cd "$BACKEND" && "$VENV/Scripts/python.exe" dev_server.py dev --no-browser --port 2024) &
 BACKEND_PID=$!
 
 sleep 8

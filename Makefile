@@ -12,7 +12,7 @@ dev-frontend:
 
 dev-backend:
 	@echo "Starting backend development server..."
-	@cd backend && langgraph dev
+	@cd backend && .venv/Scripts/python.exe dev_server.py dev --no-browser --port 2024
 
 # Run frontend and backend concurrently
 dev:

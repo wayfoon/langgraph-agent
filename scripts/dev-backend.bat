@@ -16,6 +16,10 @@ REM
 REM  Usage:
 REM    scripts\dev-backend.bat
 REM
+REM  LangGraph emits UTC timestamps by default. This script starts the server
+REM  through backend\dev_server.py, which installs an East-Asia (+08:00)
+REM  timestamp processor before the LangGraph CLI configures logging.
+REM
 REM  Chinese documentation: scripts\README.md
 REM
 REM  NOTE ON ENCODING: keep this file's comments ASCII-only. CMD parses .bat
@@ -53,6 +57,6 @@ if not exist ".venv\Scripts\langgraph.exe" (
     exit /b 1
 )
 
-".venv\Scripts\langgraph.exe" dev --no-browser --port 2024
+".venv\Scripts\python.exe" dev_server.py dev --no-browser --port 2024
 
 endlocal
