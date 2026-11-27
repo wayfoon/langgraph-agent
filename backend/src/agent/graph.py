@@ -7,7 +7,6 @@ from langgraph.types import Send
 from langgraph.graph import StateGraph
 from langgraph.graph import START, END
 from langchain_core.runnables import RunnableConfig
-from google.genai import Client
 
 from agent.state import (
     OverallState,
@@ -23,29 +22,58 @@ from agent.prompts import (
     reflection_instructions,
     answer_instructions,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
+from agent.llm_provider import get_llm, with_structured_output
+from agent.search import (
+    build_short_urls,
+    format_for_prompt,
+    search,
+)
 from agent.utils import (
-    get_citations,
     get_research_topic,
-    insert_citation_markers,
-    resolve_urls,
 )
 
 load_dotenv()
 
-if os.getenv("GEMINI_API_KEY") is None:
-    raise ValueError("GEMINI_API_KEY is not set")
 
-# Used for Google Search API
-genai_client = Client(api_key=os.getenv("GEMINI_API_KEY"))
+def _source_label(title: str) -> str:
+    """Derive a short, readable label for a cited source.
+
+    The upstream implementation used ``title.split(".")[:-1][0]``, which drops
+    the domain suffix. That crashes on titles without a dot, so the fallback
+    chain here keeps the title usable in every case.
+
+    Args:
+        title: The raw page title.
+
+    Returns:
+        A label suitable for the citation markdown link.
+    """
+    if not title:
+        return "source"
+    stripped = title.split(".")[0].strip()
+    return (stripped or title)[:80]
+
+# Provider configuration is validated lazily so the server can boot even when
+# only one of the keys is present. See agent/llm_provider.py.
+if not (
+    os.getenv("LLM_API_KEY")
+    or os.getenv("DEEPSEEK_API_KEY")
+    or os.getenv("OPENAI_API_KEY")
+    or os.getenv("DASHSCOPE_API_KEY")
+    or os.getenv("GEMINI_API_KEY")
+):
+    raise ValueError(
+        "No LLM credentials found. Set LLM_API_KEY (or DEEPSEEK_API_KEY / "
+        "OPENAI_API_KEY / DASHSCOPE_API_KEY) in backend/.env"
+    )
 
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates search queries based on the User's question.
 
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
-    the User's question.
+    Uses the configured LLM to create an optimized set of search queries for
+    web research based on the User's question.
 
     Args:
         state: Current graph state containing the User's question
@@ -60,14 +88,12 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Gemini 2.0 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
+    llm = get_llm(
+        model=configurable.query_generator_model or None,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
-    structured_llm = llm.with_structured_output(SearchQueryList)
+    structured_llm = with_structured_output(llm, SearchQueryList)
 
     # Format the prompt
     current_date = get_current_date()
@@ -78,7 +104,16 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     )
     # Generate the search queries
     result = structured_llm.invoke(formatted_prompt)
-    return {"search_query": result.query}
+
+    # Models sometimes return more queries than requested. Each extra query
+    # spawns another parallel web research branch, so cap it to keep both the
+    # latency and the token spend bounded.
+    limit = max(1, int(state["initial_search_query_count"]))
+    queries = [q for q in (result.query or []) if q and q.strip()][:limit]
+    if not queries:
+        queries = [get_research_topic(state["messages"])]
+
+    return {"search_query": queries}
 
 
 def continue_to_web_research(state: QueryGenerationState):
@@ -93,9 +128,18 @@ def continue_to_web_research(state: QueryGenerationState):
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
+    """LangGraph node that performs web research using a pluggable search backend.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    The upstream implementation calls Gemini's native ``google_search`` grounding
+    tool and reads ``grounding_metadata`` off the response. That API is
+    Google-only. This implementation instead:
+
+      1. Retrieves raw results from the configured search backend.
+      2. Feeds those results back to the LLM, which writes the summary and
+         cites sources using the ``[label](short_url)`` markdown format.
+
+    The output contract is identical to the original, so downstream nodes and
+    the frontend need no changes.
 
     Args:
         state: Current graph state containing the search query and research loop count
@@ -104,34 +148,80 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
     Returns:
         Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
     """
-    # Configure
     configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
+
+    query = state["search_query"]
+    try:
+        search_id = int(state["id"])
+    except (TypeError, ValueError):
+        search_id = 0
+
+    # Step 1 -- retrieve raw web results.
+    results = search(query, max_results=configurable.search_result_count)
+    if not results:
+        return {
+            "sources_gathered": [],
+            "web_research_result": [
+                f"No search results were found for '{query}'."
+            ],
+        }
+
+    # Step 2 -- short ids keep the answer tokens small; the final answer node
+    # swaps them back to the original URLs.
+    short_url_map = build_short_urls(results, search_id)
+
+    grounding = format_for_prompt(results)
+    formatted_prompt = (
+        web_searcher_instructions.format(
+            current_date=get_current_date(),
+            research_topic=query,
+        )
+        + "\n\nSearch Results:\n"
+        + grounding
+        + "\n\nCitation Rules (MUST FOLLOW):\n"
+        "- Cite every factual claim with the matching source number, using markdown format.\n"
+        "- The citation URL must be the short id shown below, NOT the original URL.\n"
+        "- Available short ids:\n"
+        + "\n".join(
+            f"  [{idx + 1}] -> {short_url_map[result.url]}"
+            + (f"  ({result.title})" if result.title else "")
+            for idx, result in enumerate(results)
+            if result.url in short_url_map
+        )
+        + "\n"
     )
 
-    # Uses the google genai client as the langchain client doesn't return grounding metadata
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
+    # Step 3 -- let the LLM synthesize the summary with citations.
+    llm = get_llm(
+        model=configurable.query_generator_model or None,
+        temperature=0,
+        max_retries=2,
     )
-    # resolve the urls to short urls for saving tokens and time
-    resolved_urls = resolve_urls(
-        response.candidates[0].grounding_metadata.grounding_chunks, state["id"]
+    response = llm.invoke(formatted_prompt)
+    modified_text = response.content if isinstance(response.content, str) else str(
+        response.content
     )
-    # Gets the citations and adds them to the generated text
-    citations = get_citations(response, resolved_urls)
-    modified_text = insert_citation_markers(response.text, citations)
-    sources_gathered = [item for citation in citations for item in citation["segments"]]
+
+    sources_gathered = []
+    for result in results:
+        short_url = short_url_map.get(result.url)
+        if not short_url:
+            continue
+        sources_gathered.append(
+            {
+                "label": _source_label(result.title),
+                "short_url": short_url,
+                "value": result.url,
+            }
+        )
 
     return {
         "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
+        # NOTE: the upstream implementation also wrote the query back into
+        # "search_query". Because that channel uses an appending reducer, the
+        # list grew to twice its length and the "number of queries run"
+        # counter drifted. The queries are already recorded by generate_query,
+        # so the research branch does not need to write them again.
         "web_research_result": [modified_text],
     }
 
@@ -163,18 +253,23 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
     # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
+    llm = get_llm(
+        model=reasoning_model or None,
         temperature=1.0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+    result = with_structured_output(llm, Reflection).invoke(formatted_prompt)
+
+    # Bound the follow-up fan-out: each query spawns another search branch.
+    max_follow_ups = max(1, configurable.number_of_initial_queries)
+    follow_ups = [
+        q for q in (result.follow_up_queries or []) if q and q.strip()
+    ][:max_follow_ups]
 
     return {
         "is_sufficient": result.is_sufficient,
         "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
+        "follow_up_queries": follow_ups,
         "research_loop_count": state["research_loop_count"],
         "number_of_ran_queries": len(state["search_query"]),
     }
@@ -204,17 +299,25 @@ def evaluate_research(
     )
     if state["is_sufficient"] or state["research_loop_count"] >= max_research_loops:
         return "finalize_answer"
-    else:
-        return [
-            Send(
-                "web_research",
-                {
-                    "search_query": follow_up_query,
-                    "id": state["number_of_ran_queries"] + int(idx),
-                },
-            )
-            for idx, follow_up_query in enumerate(state["follow_up_queries"])
-        ]
+
+    follow_ups = [
+        q for q in (state.get("follow_up_queries") or []) if q and q.strip()
+    ]
+    if not follow_ups:
+        # Nothing to research further -- finalize rather than spawn empty work.
+        return "finalize_answer"
+
+    base_id = int(state.get("number_of_ran_queries") or 0)
+    return [
+        Send(
+            "web_research",
+            {
+                "search_query": follow_up_query,
+                "id": base_id + idx,
+            },
+        )
+        for idx, follow_up_query in enumerate(follow_ups)
+    ]
 
 
 def finalize_answer(state: OverallState, config: RunnableConfig):
@@ -241,12 +344,11 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=reasoning_model,
+    # init the answer model
+    llm = get_llm(
+        model=reasoning_model or None,
         temperature=0,
         max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
     )
     result = llm.invoke(formatted_prompt)
 

@@ -34,13 +34,13 @@ Topic: What revenue grew more last year apple stock or the number of people buyi
 Context: {research_topic}"""
 
 
-web_searcher_instructions = """Conduct targeted Google Searches to gather the most recent, credible information on "{research_topic}" and synthesize it into a verifiable text artifact.
+web_searcher_instructions = """Gather the most recent, credible information on "{research_topic}" and synthesize it into a verifiable text artifact.
 
 Instructions:
 - Query should ensure that the most current information is gathered. The current date is {current_date}.
-- Conduct multiple, diverse searches to gather comprehensive information.
+- Use the provided Search Results as your source material; do not rely on prior knowledge for specifics.
 - Consolidate key findings while meticulously tracking the source(s) for each specific piece of information.
-- The output should be a well-written summary or report based on your search findings. 
+- The output should be a well-written summary or report based on your search findings.
 - Only include the information found in the search results, don't make up any information.
 
 Research Topic:
@@ -87,7 +87,8 @@ Instructions:
 - You have access to all the information gathered from the previous steps.
 - You have access to the user's question.
 - Generate a high-quality answer to the user's question based on the provided summaries and the user's question.
-- Include the sources you used from the Summaries in the answer correctly, use markdown format (e.g. [apnews](https://vertexaisearch.cloud.google.com/id/1-0)). THIS IS A MUST.
+- Include the sources you used from the Summaries in the answer correctly, use markdown format (e.g. [apnews](https://research.local/id/1-0)). THIS IS A MUST.
+- Use the exact short URLs that appear in the Summaries as the citation link target. Do not invent or modify them.
 
 User Context:
 - {research_topic}

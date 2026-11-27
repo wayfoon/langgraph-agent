@@ -15,6 +15,9 @@ export default function App() {
   >({});
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const hasFinalizeEventOccurredRef = useRef(false);
+  // Tracks which graph nodes have already been reported, so each node shows up
+  // in the activity timeline exactly once.
+  const completedNodesRef = useRef<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const thread = useStream<{
     messages: Message[];
@@ -29,12 +32,23 @@ export default function App() {
     messagesKey: "messages",
     onUpdateEvent: (event: any) => {
       let processedEvent: ProcessedEvent | null = null;
-      if (event.generate_query) {
+
+      // The SDK hands over the accumulated graph state, so once a node has
+      // produced output its key stays present in every later event. Checking
+      // the keys in a fixed order therefore latches onto the first node and
+      // never reports the ones that follow. The set of keys that appeared in
+      // this particular event is tracked separately, so each node is reported
+      // exactly when it actually runs.
+      const nodeKeys = Object.keys(event || {});
+      const newlyCompleted = nodeKeys.filter((key) => !completedNodesRef.current.has(key));
+      newlyCompleted.forEach((key) => completedNodesRef.current.add(key));
+
+      if (newlyCompleted.includes("generate_query")) {
         processedEvent = {
           title: "Generating Search Queries",
           data: event.generate_query?.search_query?.join(", ") || "",
         };
-      } else if (event.web_research) {
+      } else if (newlyCompleted.includes("web_research")) {
         const sources = event.web_research.sources_gathered || [];
         const numSources = sources.length;
         const uniqueLabels = [
@@ -47,12 +61,12 @@ export default function App() {
             exampleLabels || "N/A"
           }.`,
         };
-      } else if (event.reflection) {
+      } else if (newlyCompleted.includes("reflection")) {
         processedEvent = {
           title: "Reflection",
           data: "Analysing Web Research Results",
         };
-      } else if (event.finalize_answer) {
+      } else if (newlyCompleted.includes("finalize_answer")) {
         processedEvent = {
           title: "Finalizing Answer",
           data: "Composing and presenting the final answer.",
@@ -104,6 +118,7 @@ export default function App() {
       if (!submittedInputValue.trim()) return;
       setProcessedEventsTimeline([]);
       hasFinalizeEventOccurredRef.current = false;
+      completedNodesRef.current = new Set();
 
       // convert effort to, initial_search_query_count and max_research_loops
       // low means max 1 loop and 1 query

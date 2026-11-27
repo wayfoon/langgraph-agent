@@ -9,23 +9,23 @@ class Configuration(BaseModel):
     """The configuration for the agent."""
 
     query_generator_model: str = Field(
-        default="gemini-2.0-flash",
+        default="",
         metadata={
-            "description": "The name of the language model to use for the agent's query generation."
+            "description": "The name of the language model to use for the agent's query generation. Empty means the provider default."
         },
     )
 
     reflection_model: str = Field(
-        default="gemini-2.5-flash",
+        default="",
         metadata={
-            "description": "The name of the language model to use for the agent's reflection."
+            "description": "The name of the language model to use for the agent's reflection. Empty means the provider default."
         },
     )
 
     answer_model: str = Field(
-        default="gemini-2.5-pro",
+        default="",
         metadata={
-            "description": "The name of the language model to use for the agent's answer."
+            "description": "The name of the language model to use for the agent's answer. Empty means the provider default."
         },
     )
 
@@ -37,6 +37,11 @@ class Configuration(BaseModel):
     max_research_loops: int = Field(
         default=2,
         metadata={"description": "The maximum number of research loops to perform."},
+    )
+
+    search_result_count: int = Field(
+        default=5,
+        metadata={"description": "The number of web search results fetched per query."},
     )
 
     @classmethod
