@@ -1,122 +1,328 @@
-# Gemini Fullstack LangGraph Quickstart
+# 全栈 LangGraph 深度研究 Agent
 
-> **[中文文档](./README.zh-CN.md)** — 架构说明、配置项、启动步骤与常见问题排查。
+> **[English Documentation](./README.en.md)** — Full-stack LangGraph deep research agent.
 
-This project demonstrates a fullstack application using a React frontend and a LangGraph-powered backend agent. The agent is designed to perform comprehensive research on a user's query by dynamically generating search terms, querying the web using Google Search, reflecting on the results to identify knowledge gaps, and iteratively refining its search until it can provide a well-supported answer with citations. This application serves as an example of building research-augmented conversational AI using LangGraph and Google's Gemini models.
+> React + Vite 前端 · LangGraph 后端 · DeepSeek 大模型 · Bing 联网检索
 
-<img src="./app.png" title="Gemini Fullstack LangGraph" alt="Gemini Fullstack LangGraph" width="90%">
+一个具备**联网检索 + 引用溯源**能力的对话式研究 Agent。用户提出问题，Agent 自动拆解为多条搜索查询 → 并发联网检索 → 反思信息是否充分 → 必要时迭代补充 → 最终输出带编号引用的完整回答。
 
-## Features
+基于 Google 开源的 LangGraph 示例框架改造，将模型层与检索层抽象为可切换的 provider，
+默认接入 DeepSeek 与 Bing；已适配通义千问、Ollama、OpenAI 等模型。
 
-- 💬 Fullstack application with a React frontend and LangGraph backend.
-- 🧠 Powered by a LangGraph agent for advanced research and conversational AI.
-- 🔍 Dynamic search query generation using Google Gemini models.
-- 🌐 Integrated web research via Google Search API.
-- 🤔 Reflective reasoning to identify knowledge gaps and refine searches.
-- 📄 Generates answers with citations from gathered sources.
-- 🔄 Hot-reloading for both frontend and backend during development.
+> **注意 Token 消耗**：Agent 会执行「生成查询 → 并发检索 → 反思 → 迭代补充」多轮循环，
+> 单次提问的 Token 消耗显著高于普通对话 API。默认 3 条初始查询、最多 2 轮研究循环，
+> 可通过 `configuration.py` 中的 `number_of_initial_queries` 与 `max_research_loops` 下调。
 
-## Project Structure
+---
 
-The project is divided into two main directories:
+## 目录
 
--   `frontend/`: Contains the React application built with Vite.
--   `backend/`: Contains the LangGraph/FastAPI application, including the research agent logic.
+- [核心能力](#核心能力)
+- [界面预览](#界面预览)
+- [技术架构](#技术架构)
+- [快速启动](#快速启动)
+- [手工启动（Git Bash 简版）](#手工启动git-bash-简版)
+- [配置说明](#配置说明)
+- [项目结构](#项目结构)
+- [生产部署](#生产部署)
+- [许可](#许可)
 
-## Getting Started: Development and Local Testing
+---
 
-Follow these steps to get the application running locally for development and testing.
+## 核心能力
 
-**1. Prerequisites:**
+| 能力             | 说明                                                                  |
+| ---------------- | --------------------------------------------------------------------- |
+| **查询自动生成** | 把用户的自然语言问题拆解成 1～N 条精准搜索查询                        |
+| **并发联网检索** | 多条查询并行发起，汇总去重后回灌给模型                                |
+| **反思迭代**     | 评估检索材料的充分性，有信息缺口时自动补充新一轮检索（默认最多 2 轮） |
+| **引用溯源**     | 回答中嵌入 `[1]`、`[2]` 编号，可点击跳转原文                          |
+| **供应商可切换** | 模型层、检索层均为抽象层，换厂商只改 `.env`，不动代码                 |
+| **前后端热重载** | 后端 `langgraph dev` 与前端 Vite 均支持热更新，改代码即时生效         |
 
--   Node.js and npm (or yarn/pnpm)
--   Python 3.11+
--   **`GEMINI_API_KEY`**: The backend agent requires a Google Gemini API key.
-    1.  Navigate to the `backend/` directory.
-    2.  Create a file named `.env` by copying the `backend/.env.example` file.
-    3.  Open the `.env` file and add your Gemini API key: `GEMINI_API_KEY="YOUR_ACTUAL_API_KEY"`
+---
 
-**2. Install Dependencies:**
+## 界面预览
 
-**Backend:**
+### 研究模式：执行过程可追溯
 
-```bash
-cd backend
-pip install .
+展开顶部的 **Research** 面板，可以看到 Agent 的完整执行链路 —— 每一步都标注了做了什么、
+收集到多少条素材：
+
+![Research 模式执行过程](./docs/images/research-timeline.png)
+
+四个阶段对应后端图的四个节点：
+
+| 阶段                      | 对应节点          | 含义                               |
+| ------------------------- | ----------------- | ---------------------------------- |
+| Generating Search Queries | `generate_query`  | 把问题拆解为多条搜索查询           |
+| Web Research              | `web_research`    | 并发检索并汇总去重                 |
+| Reflection                | `reflection`      | 评估信息充分性，识别知识缺口       |
+| Finalizing Answer         | `finalize_answer` | 综合所有素材，生成带引用的最终回答 |
+
+### 回答结果：每条结论都可回溯原文
+
+![带引用的回答结果](./docs/images/chat-answer.png)
+
+回答正文中嵌入 `[1]`、`[2]` 编号，点击即可跳转到对应来源。
+当检索材料不足以支撑结论时，Agent 会**明确说明信息不足**，而不是编造答案 —— 末尾还会列出
+「需要补充哪些材料才能核验」。
+
+---
+
+## 技术架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  前端  React 19 + Vite 6 + Tailwind CSS 4 + shadcn/ui   │
+│  http://localhost:5173/app/                              │
+└──────────────────────┬──────────────────────────────────┘
+                       │ LangGraph SDK (HTTP + SSE 流式)
+┌──────────────────────▼──────────────────────────────────┐
+│  后端  LangGraph API (FastAPI)                          │
+│  http://127.0.0.1:2024                                  │
+│                                                         │
+│   generate_query ──► web_research ──► reflection ──┐    │
+│         ▲                                           │    │
+│         └────────── 信息不足则回环 ◄───────────────┘    │
+│                                                     │    │
+│                                            finalize_answer │
+└──────────────────────┬──────────────────────────────────┘
+                       │
+        ┌──────────────┴──────────────┐
+        │                             │
+   llm_provider.py               search.py
+   deepseek / openai            bing（免 Key）
+   dashscope / ollama           tavily（需 Key）
+                                 gemini（原生）
 ```
 
-**Frontend:**
+### 四个核心节点
 
-```bash
+| 节点              | 职责                               |
+| ----------------- | ---------------------------------- |
+| `generate_query`  | 生成初始搜索查询列表               |
+| `web_research`    | 执行检索 → 交给 LLM 带引用地总结   |
+| `reflection`      | 判断信息是否充分，识别知识缺口     |
+| `finalize_answer` | 综合所有材料，输出带引用的最终回答 |
+
+### 关键设计
+
+**模型抽象层**（`backend/src/agent/llm_provider.py`）  
+统一走 OpenAI 兼容协议，DeepSeek / 通义千问 / Ollama / OpenAI 均可接入。自动处理各家 API 差异 —— 例如 DeepSeek 不支持 `json_schema` 结构化输出，只接受 `json_object`，provider 层会自动降级，避免请求时才报错。
+
+**检索抽象层**（`backend/src/agent/search.py`）  
+上游项目使用 Gemini 专属的 `google_search` grounding 工具，该接口是 Google 私有能力、在多数企业网络不可达。本模块以「bing 抓取 / tavily API / gemini 原生」三种后端实现同一份契约，**保持输出结构不变，前端无需任何改动**。
+
+---
+
+## 快速启动
+
+### 前置要求
+
+- Python 3.11+
+- Node.js 18+
+- 一个可用的大模型 API Key（默认 DeepSeek）
+
+### Windows（CMD）—— 推荐
+
+```cmd
+scripts\dev.bat
+```
+
+自动弹出两个独立窗口分别跑前后端，日志互不干扰。
+
+### Windows（CMD）—— 手工分窗口
+
+**窗口一（后端）**，任选一种：
+
+```cmd
+REM 方式 1：脚本（内置 UTF-8 环境变量，最省心）
+scripts\dev-backend.bat
+
+REM 方式 2：单行命令，无需设任何环境变量
+cd backend
+.\.venv\Scripts\python.exe -X utf8 -m langgraph_cli dev --no-browser --port 2024
+
+REM 方式 3：先激活虚拟环境，再用原命令
+cd backend
+.venv\Scripts\activate
+.\.venv\Scripts\langgraph.exe dev --no-browser --port 2024
+```
+
+**窗口二（前端）**：
+
+```cmd
+scripts\dev-frontend.bat
+```
+
+或：
+
+```cmd
 cd frontend
-npm install
+npm run dev
 ```
 
-**3. Run Development Servers:**
+启动成功标志：
 
-**Backend & Frontend:**
+```
+- 🚀 API: http://127.0.0.1:2024
+- 📚 API Docs: http://127.0.0.1:2024/docs
+```
+
+```
+VITE v6.3.4  ready in 4287 ms
+➜  Local:   http://localhost:5173/app/
+```
+
+### macOS / Linux / Git Bash
 
 ```bash
-make dev
+cd D:/open/ai-code/wayfoon/langgraph-agent
+bash scripts/dev.sh
 ```
-This will run the backend and frontend development servers.    Open your browser and navigate to the frontend development server URL (e.g., `http://localhost:5173/app`).
 
-_Alternatively, you can run the backend and frontend development servers separately. For the backend, open a terminal in the `backend/` directory and run `langgraph dev`. The backend API will be available at `http://127.0.0.1:2024`. It will also open a browser window to the LangGraph UI. For the frontend, open a terminal in the `frontend/` directory and run `npm run dev`. The frontend will be available at `http://localhost:5173`._
+脚本会依次拉起后端和前端，按 `Ctrl+C` 一并停止。
 
-## How the Backend Agent Works (High-Level)
+### 启动效果
 
-The core of the backend is a LangGraph agent defined in `backend/src/agent/graph.py`. It follows these steps:
+用 `scripts\dev.bat` 启动后，会弹出两个终端窗口 —— 上方是前端 Vite，下方是后端 LangGraph：
 
-<img src="./agent.png" title="Agent Flow" alt="Agent Flow" width="50%">
+![前后端启动效果](./docs/images/dev-console.png)
 
-1.  **Generate Initial Queries:** Based on your input, it generates a set of initial search queries using a Gemini model.
-2.  **Web Research:** For each query, it uses the Gemini model with the Google Search API to find relevant web pages.
-3.  **Reflection & Knowledge Gap Analysis:** The agent analyzes the search results to determine if the information is sufficient or if there are knowledge gaps. It uses a Gemini model for this reflection process.
-4.  **Iterative Refinement:** If gaps are found or the information is insufficient, it generates follow-up queries and repeats the web research and reflection steps (up to a configured maximum number of loops).
-5.  **Finalize Answer:** Once the research is deemed sufficient, the agent synthesizes the gathered information into a coherent answer, including citations from the web sources, using a Gemini model.
+后端日志出现 `Application started up` 即表示服务就绪；前端显示 `Local: http://localhost:5173/app/` 后即可打开浏览器。
 
-## CLI Example
+---
 
-For quick one-off questions you can execute the agent from the command line. The
-script `backend/examples/cli_research.py` runs the LangGraph agent and prints the
-final answer:
+## 手工启动（Git Bash 简版）
+
+**推荐用两个独立的终端窗口**，这样后端崩溃时前端日志不会被冲掉，日志更好排查。
+
+### 窗口一：启动后端
 
 ```bash
-cd backend
-python examples/cli_research.py "What are the latest trends in renewable energy?"
+cd D:/open/ai-code/wayfoon/langgraph-agent/backend
+./.venv/Scripts/langgraph.exe dev --no-browser --port 2024
 ```
 
+### 窗口二：启动前端
 
-## Deployment
+```bash
+cd D:/open/ai-code/wayfoon/langgraph-agent/frontend
+npm run dev
+```
 
-In production, the backend server serves the optimized static frontend build. LangGraph requires a Redis instance and a Postgres database. Redis is used as a pub-sub broker to enable streaming real time output from background runs. Postgres is used to store assistants, threads, runs, persist thread state and long term memory, and to manage the state of the background task queue with 'exactly once' semantics. For more details on how to deploy the backend server, take a look at the [LangGraph Documentation](https://langchain-ai.github.io/langgraph/concepts/deployment_options/). Below is an example of how to build a Docker image that includes the optimized frontend build and the backend server and run it via `docker-compose`.
+启动成功标志：
 
-_Note: For the docker-compose.yml example you need a LangSmith API key, you can get one from [LangSmith](https://smith.langchain.com/settings)._
+```
+VITE v6.3.4  ready in 4287 ms
+➜  Local:   http://localhost:5173/app/
+```
 
-_Note: If you are not running the docker-compose.yml example or exposing the backend server to the public internet, you should update the `apiUrl` in the `frontend/src/App.tsx` file to your host. Currently the `apiUrl` is set to `http://localhost:8123` for docker-compose or `http://localhost:2024` for development._
+### 访问
 
-**1. Build the Docker Image:**
+浏览器打开 **<http://localhost:5173/app/>**
 
-   Run the following command from the **project root directory**:
-   ```bash
-   docker build -t gemini-fullstack-langgraph -f Dockerfile .
-   ```
-**2. Run the Production Server:**
+---
 
-   ```bash
-   GEMINI_API_KEY=<your_gemini_api_key> LANGSMITH_API_KEY=<your_langsmith_api_key> docker-compose up
-   ```
+## 配置说明
 
-Open your browser and navigate to `http://localhost:8123/app/` to see the application. The API will be available at `http://localhost:8123`.
+### 模型服务
 
-## Technologies Used
+| 变量           | 说明                                                    | 默认值                        |
+| -------------- | ------------------------------------------------------- | ----------------------------- |
+| `LLM_PROVIDER` | `deepseek` / `openai` / `dashscope` / `ollama`          | `deepseek`                    |
+| `LLM_API_KEY`  | API Key，留空则回退到 `DEEPSEEK_API_KEY` 等同名环境变量 | —                             |
+| `LLM_BASE_URL` | 接口地址，留空用供应商默认地址                          | `https://api.deepseek.com/v1` |
+| `LLM_MODEL`    | 模型 ID                                                 | `deepseek-flash`              |
 
-- [React](https://reactjs.org/) (with [Vite](https://vitejs.dev/)) - For the frontend user interface.
-- [Tailwind CSS](https://tailwindcss.com/) - For styling.
-- [Shadcn UI](https://ui.shadcn.com/) - For components.
-- [LangGraph](https://github.com/langchain-ai/langgraph) - For building the backend research agent.
-- [Google Gemini](https://ai.google.dev/models/gemini) - LLM for query generation, reflection, and answer synthesis.
+当前可用模型：`deepseek-flash`（快、默认）、`deepseek-v4-pro`（强、贵）。
 
-## License
+### 切换到其他供应商示例
 
-This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details. 
+换成通义千问：
+
+```bash
+LLM_PROVIDER=dashscope
+LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+LLM_MODEL=qwen-plus
+LLM_API_KEY=sk-xxxxxxxx
+```
+
+换成本地 Ollama：
+
+```bash
+LLM_PROVIDER=ollama
+LLM_BASE_URL=http://localhost:11434/v1
+LLM_MODEL=qwen2.5:7b
+```
+
+> `ollama` 与 `deepseek` 一样只支持 `json_object` 模式，provider 层已自动处理。
+
+---
+
+## 项目结构
+
+```
+langgraph-agent/
+├── backend/                     # LangGraph 后端
+│   ├── .env                     # 配置（API Key，不入版本库）
+│   ├── requirements.lock.txt    # 依赖版本锁定
+│   ├── langgraph.json           # 图注册与 HTTP 应用入口
+│   ├── pyproject.toml
+│   ├── examples/
+│   │   └── cli_research.py      # 命令行单次问答
+│   └── src/agent/
+│       ├── graph.py             # 图编排：四个节点 + 条件边
+│       ├── llm_provider.py     # 模型抽象层
+│       ├── search.py            # 检索抽象层
+│       ├── configuration.py     # 运行期参数（可被前端下拉框覆盖）
+│       ├── state.py             # 状态定义 + 去重 reducer
+│       ├── prompts.py           # 提示词模板
+│       ├── tools_and_schemas.py # 结构化输出 schema
+│       ├── app.py               # FastAPI 自定义应用
+│       └── utils.py             # 工具函数
+├── frontend/                    # React 前端
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── src/
+│       ├── App.tsx              # 主容器，流式订阅
+│       ├── main.tsx             # 入口
+│       ├── global.css           # 全局样式
+│       └── components/
+│           ├── ChatMessagesView.tsx   # 消息与引用渲染
+│           ├── ActivityTimeline.tsx    # 节点活动时间线
+│           ├── InputForm.tsx          # 输入框 + 模型/强度选择
+│           ├── WelcomeScreen.tsx
+│           └── ui/                     # shadcn/ui 基础组件
+├── docs/
+│   └── images/                  # README 配图
+├── scripts/
+    ├── dev.sh                   # 一键启动（Git Bash / macOS / Linux）
+    ├── dev.bat                  # 一键启动（Windows CMD，弹两个窗口）
+    ├── dev-backend.bat          # 仅启动后端（内置 UTF-8 环境变量）
+    ├── dev-frontend.bat         # 仅启动前端
+    ├── setup-venv.bat           # 重建虚拟环境 + 自动应用 UTF-8 修复
+    └── patch_activate_utf8.py   # 向 activate.bat 注入 PYTHONUTF8=1（幂等）
+```
+
+---
+
+## 生产部署
+
+生产环境需要 **Redis**（消息队列，用于流式输出）与 **PostgreSQL**（存储 assistants / threads / runs 及长期记忆）。
+
+```bash
+docker build -t gemini-fullstack-langgraph -f Dockerfile .
+docker compose up
+```
+
+服务启动后访问 <http://localhost:8123/app/>。
+
+> Docker 部署时需额外提供 `LANGSMITH_API_KEY`。
+
+---
+
+## 许可
+
+基于 [Apache License 2.0](LICENSE) 的 LangGraph 官方示例改造而来。
